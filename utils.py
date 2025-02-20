@@ -1,5 +1,9 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
+from Arguments import Arguments
+
+args = Arguments()
 
 def qubit_fold(jobs, phase, fold=1):
     if fold > 1:
@@ -104,7 +108,7 @@ def get_label(energy, tree_height, mean = None):
                 label[index[j]] = torch.tensor([int(char) for char in string_num])
     return label
 
-def load_data():
+def load_data(rep = 'explicit'):
     fold = 1
     with open('data/MNIST_4.csv', 'r') as f:
         data = f.readlines()
@@ -113,16 +117,154 @@ def load_data():
         nets = []
         accs = []
 
-        for i in range(len(data)):
-            single = data[i][0]
-            enta = data[i][1]
-            acc = data[i][2]
-            arch_code = [len(enta), len(enta[0])-1]
-            arch = cir_to_matrix(single, enta, arch_code, fold)
-            nets.append(arch)
-            accs.append(acc)
+        if rep == 'explicit':
+            for i in range(len(data)):
+                single = data[i][0]
+                enta = data[i][1]
+                acc = data[i][2]
+                arch_code = [len(enta), len(enta[0])-1]
+                arch = cir_to_matrix(single, enta, arch_code, fold)
+                nets.append(arch)
+                accs.append(acc)
 
-        nets = torch.from_numpy(np.asarray(nets, dtype=np.float32))
-        nets = normalize(nets)
+            nets = torch.from_numpy(np.asarray(nets, dtype=np.float32))
+            nets = normalize(nets)
+        else:
+            for s ,e, a in data:
+                s = np.array(s)
+                datauploading = [d[[1, 3, 5, 7]] for d in s]
+                rot = [d[[2, 4, 6, 8]] for d in s]
+                enta = [d[1:] for d in e]
+                nets.append((datauploading, rot, enta))
+                accs.append(a)
 
     return nets, accs
+
+def encode_gate_type():
+    gate_dict = {}
+    ops = args.allowed_gates.copy()
+    ops.insert(0, 'START')
+    ops.append('END')
+    ops_len = len(ops)
+    ops_index = torch.tensor(range(ops_len))
+    type_onehot = F.one_hot(ops_index, num_classes=ops_len)
+    for i in range(ops_len):
+        gate_dict[ops[i]] = type_onehot[i]
+    return gate_dict
+
+def get_wires(op):
+    if op[0] == 'C(U3)':
+        return [op[1], op[2]]
+    else:
+        return [op[1]]
+
+def get_gate_and_adj_matrix(circuit_list, arch_code):
+    n_qubits = arch_code[0]
+    gate_matrix = []
+    op_list = []
+    cl = list(circuit_list).copy()
+    if cl[0] != 'START':
+        cl.insert(0, 'START')
+    if cl[-1] != 'END':
+        cl.append('END')
+    # cg = get_circuit_graph(circuit_list)
+    gate_dict = encode_gate_type()
+    gate_matrix.append(gate_dict['START'].tolist() + [1] * n_qubits)
+    op_list.append('START')
+    for op in circuit_list:
+        op_list.append(op)
+        op_qubits = [0] * n_qubits
+        op_wires = get_wires(op)
+        for i in op_wires:
+            op_qubits[i] = 1
+        op_vector = gate_dict[op[0]].tolist() + op_qubits
+        gate_matrix.append(op_vector)
+    gate_matrix.append(gate_dict['END'].tolist() + [1] * n_qubits)
+    op_list.append('END')
+
+    op_len = len(op_list)
+    adj_matrix = np.zeros((op_len, op_len), dtype=int)
+    for index, op in enumerate(circuit_list):
+        ancestors = []
+        target_wires = get_wires(op)
+        if op[0] == 'C(U3)':
+            found_wires = {target_wires[0]: False, target_wires[1]: False}
+            max_ancestors = 2
+        else:
+            found_wires = {target_wires[0]: False}
+            max_ancestors = 1
+
+        for i in range(index - 1, -1, -1):
+            op_wires = get_wires(circuit_list[i])
+            if any(not found_wires[w] for w in op_wires if w in found_wires):
+                ancestors.append(circuit_list[i])
+
+                for w in op_wires:
+                    if w in found_wires:
+                        found_wires[w] = True
+                if len(ancestors) >= max_ancestors:
+                    break
+        if len(ancestors) == 0:
+            adj_matrix[0][op_list.index(op)] = 1
+        else:
+            for j in range(len(ancestors)):
+                adj_matrix[op_list.index(ancestors[j])][op_list.index(op)] = 1
+
+        descendants = []
+        if op[0] == 'C(U3)':
+            found_wires = {target_wires[0]: False, target_wires[1]: False}
+            max_descendants = 2
+        else:
+            found_wires = {target_wires[0]: False}
+            max_descendants = 1
+
+        for i in range(index + 1, len(circuit_list)):
+            op_wires = get_wires(circuit_list[i])
+            if any(not found_wires[w] for w in op_wires if w in found_wires):
+                descendants.append(circuit_list[i])
+                for w in op_wires:
+                    if w in found_wires:
+                        found_wires[w] = True
+                if len(descendants) >= max_descendants:
+                    break
+        if len(descendants) < max_descendants:
+            adj_matrix[op_list.index(op)][op_len - 1] = 1
+
+    return cl, gate_matrix, adj_matrix
+
+configs = [{'GAE': # 0
+                {'activation_ops':torch.sigmoid},
+            'loss':
+                {'loss_ops':F.mse_loss, 'loss_adj':F.mse_loss},
+            'prep':
+                {'method':3, 'lbd':0.5}
+            },
+           {'GAE': # 1
+                {'activation_ops':torch.softmax},
+            'loss':
+                {'loss_ops':torch.nn.BCELoss(), 'loss_adj':torch.nn.BCELoss()},
+            'prep':
+                {'method':3, 'lbd':0.5}
+            },
+           {'GAE': # 2
+                {'activation_ops': torch.softmax},
+            'loss':
+                {'loss_ops': F.mse_loss, 'loss_adj': torch.nn.BCELoss()},
+            'prep':
+                {'method':3, 'lbd':0.5}
+            },
+           {'GAE':# 3
+                {'activation_ops':torch.sigmoid},
+            'loss':
+                {'loss_ops':F.mse_loss, 'loss_adj':F.mse_loss},
+            'prep':
+                {'method':4, 'lbd':1.0}
+            },
+           {'GAE': # 4
+                {'activation_adj': torch.sigmoid, 'activation_ops': torch.softmax, 'adj_hidden_dim': 128, 'ops_hidden_dim': 128},
+            'loss':
+                {'loss_ops': torch.nn.BCELoss(), 'loss_adj': torch.nn.BCELoss()},
+            'prep':
+                {'method': 4, 'lbd': 1.0}
+            },
+           ]
